@@ -1,0 +1,820 @@
+#!/usr/bin/env bash
+# conda-squash - collapse a conda environment into a single squashfs image.
+#
+# An environment full of small files is expensive on a shared filesystem: it
+# burns inode quota and every import is a burst of metadata round-trips.  This
+# packs the whole environment into one compressed file and mounts it back at
+# its own original path, so nothing inside the environment needs rewriting and
+# it behaves exactly as it did before - only faster, and one file instead of
+# tens of thousands.
+#
+# https://github.com/saarantras/conda-squash
+set -euo pipefail
+
+VERSION=0.1.0
+PROG=${0##*/}
+SELF=$(readlink -f "$0")
+HOST=${HOSTNAME%%.*}
+
+# ---------------------------------------------------------------- discovery --
+# squashfuse and mksquashfs are often present only inside an Apptainer or
+# Singularity install, which is very common on clusters that ship neither as a
+# system package.  Look there before giving up.
+_libexec_dirs() {
+    local base
+    for base in /usr/libexec /usr/local/libexec /opt/apptainer/libexec \
+                /usr/lib /usr/local/lib; do
+        printf '%s/apptainer/bin\n%s/singularity/bin\n' "$base" "$base"
+    done
+    # Wherever the apptainer binary itself lives, its libexec is usually nearby.
+    local ap
+    if ap=$(command -v apptainer singularity 2>/dev/null | head -1); then
+        ap=$(dirname "$(dirname "$(readlink -f "$ap")")")
+        printf '%s/libexec/apptainer/bin\n%s/libexec/singularity/bin\n' "$ap" "$ap"
+    fi
+}
+
+find_tool() {
+    local want=$1 alt=${2:-} p d
+    for p in "$want" $alt; do
+        command -v "$p" 2>/dev/null && return 0
+    done
+    while read -r d; do
+        for p in "$want" $alt; do
+            [[ -x "$d/$p" ]] && { printf '%s\n' "$d/$p"; return 0; }
+        done
+    done < <(_libexec_dirs)
+    return 1
+}
+
+SQUASHFUSE=$(find_tool squashfuse_ll squashfuse || true)
+MKSQUASHFS=$(find_tool mksquashfs || true)
+UNSQUASHFS=$(find_tool unsquashfs || true)
+FUSERMOUNT=$(find_tool fusermount3 fusermount || true)
+FLOCK=$(command -v flock || true)
+PDEATHSIG=0
+[[ $(setpriv --help 2>&1 || true) == *--pdeathsig* ]] && PDEATHSIG=1
+
+REGISTRY=${CONDA_SQUASH_REGISTRY:-${XDG_DATA_HOME:-$HOME/.local/share}/conda-squash}
+LOCKS=$REGISTRY/locks
+REFS=$REGISTRY/refs
+
+die()  { printf '%s: %s\n' "$PROG" "$*" >&2; exit 1; }
+warn() { printf '%s: %s\n' "$PROG" "$*" >&2; }
+info() { [[ ${QUIET:-0} == 1 ]] || printf '%s\n' "$*" >&2; }
+
+need() {
+    local var=$1 what=$2
+    [[ -n "${!var}" ]] || die "cannot find $what. Install squashfs-tools, fuse3 and util-linux, \
+or run somewhere Apptainer/Singularity is installed (it bundles squashfuse and mksquashfs)."
+}
+
+# Inside 'conda-squash exec' the mount table is private and disappears with the
+# command, so changing mounts from in there would only confuse things - and a
+# squashfuse started there would keep the namespace alive after exit.
+not_in_exec() {
+    [[ -z ${CONDA_SQUASH_NS:-} ]] || die "this shell is inside '$PROG exec ${CONDA_SQUASH_NS}', \
+where mounts are private and temporary. Run '$PROG $1' from outside it."
+}
+
+valid_name() {
+    [[ $1 =~ ^[A-Za-z0-9._+-]+$ ]] || die "invalid environment name '$1' (letters, digits, . _ + - only)"
+}
+
+# --------------------------------------------------------------------- locks --
+# One lock per environment, held on fd 8 for the life of the command, so two
+# commands never pack, unpack, mount or unmount the same environment at once.
+# Anything long-lived started while it is held must close fd 8 (7>&- 8>&-),
+# or the lock outlives the command.  Over NFS this is as reliable as the
+# server's lock manager.
+lock_env() {                       # name wait-seconds (0: fail immediately)
+    local name=$1 wait=$2
+    need FLOCK "flock"
+    mkdir -p "$LOCKS"
+    exec 8>"$LOCKS/$name.lock"
+    "$FLOCK" -n 8 && return 0
+    [[ $wait -gt 0 ]] || die "another $PROG command is already working on '$name'"
+    info "waiting for another $PROG command working on '$name' ..."
+    "$FLOCK" -w "$wait" 8 || die "gave up after ${wait}s waiting for another $PROG command on '$name'"
+}
+
+unlock_env() { exec 8>&-; }
+
+# ------------------------------------------------------------------ registry --
+# One line per packed environment: <name>\t<image>\t<prefix>
+index_file() { printf '%s/index\n' "$REGISTRY"; }
+
+# Rewrites go through a private temp file under a registry-wide lock on fd 7,
+# so concurrent commands on different environments cannot drop each other's
+# rows.  Readers see either the old or the new file, never a partial one.
+index_rewrite() {                  # awk-program [name image prefix]
+    local prog=$1 name=${2:-} image=${3:-} prefix=${4:-} idx tmp
+    need FLOCK "flock"
+    idx=$(index_file); mkdir -p "$REGISTRY"; touch "$idx"
+    {
+        "$FLOCK" -w 60 7 || die "gave up after 60s waiting for the index lock"
+        tmp=$(mktemp "$idx.XXXXXX")
+        awk -F'\t' -v OFS='\t' -v n="$name" -v i="$image" -v p="$prefix" "$prog" "$idx" > "$tmp"
+        mv "$tmp" "$idx"
+    } 7>"$REGISTRY/index.lock"
+}
+
+index_put() { index_rewrite '$1 != n { print } END { print n, i, p }' "$1" "$2" "$3"; }
+index_del() { index_rewrite '$1 != n { print }' "$1"; }
+
+index_get() {                      # name -> "image<TAB>prefix", or nonzero
+    local idx; idx=$(index_file)
+    [[ -f "$idx" ]] || return 1
+    awk -F'\t' -v n="$1" '$1 == n { print $2 "\t" $3; found = 1; exit } END { exit !found }' "$idx"
+}
+
+resolve() {                        # name [allow-missing] -> sets IMAGE, PREFIX
+    local name=$1 row
+    row=$(index_get "$name") || die "'$name' is not packed. Try: $PROG list"
+    IMAGE=$(cut -f1 <<<"$row"); PREFIX=$(cut -f2 <<<"$row")
+    [[ ${2:-} == allow-missing || -f "$IMAGE" ]] || die "image for '$name' is missing: $IMAGE"
+}
+
+# -------------------------------------------------------------------- mounts --
+# The fstype of whatever is mounted at exactly this path, or nonzero if nothing
+# is.  mountinfo escapes space, tab, newline and backslash as octal; the
+# escaped path goes through the environment because awk -v would unescape it.
+mount_fstype() {
+    local p=$1
+    p=${p//\\/\\134}; p=${p// /\\040}; p=${p//$'\t'/\\011}; p=${p//$'\n'/\\012}
+    MI_PATH=$p awk '$5 == ENVIRON["MI_PATH"] {
+        for (i = 7; i <= NF; i++) if ($i == "-") { t = $(i + 1); break }
+        found = 1
+    } END { if (!found) exit 1; print t }' /proc/self/mountinfo
+}
+
+# mounted | stale | none.  A squashfuse process that dies - killed at the end
+# of a Slurm job, say - leaves its mount listed, but every access to the path
+# fails with "Transport endpoint is not connected".  Probe with a directory
+# read: stat can keep answering from the kernel's attribute cache for seconds
+# after the daemon is gone, but only the daemon can list a directory.
+mount_state() {
+    mount_fstype "$1" >/dev/null || { echo none; return 0; }
+    if ls -A -- "$1" >/dev/null 2>&1; then echo mounted; else echo stale; fi
+}
+
+is_mounted() { [[ $(mount_state "$1") != none ]]; }
+
+clean_stale() {
+    local d=$1 t
+    [[ $(mount_state "$d") == stale ]] || return 0
+    t=$(mount_fstype "$d")
+    [[ $t == fuse* ]] || die "$d is a stale $t mount that $PROG did not make; not touching it"
+    need FUSERMOUNT "fusermount"
+    warn "clearing a stale mount at $d (its squashfuse process is gone)"
+    "$FUSERMOUNT" -u "$d"
+    [[ $(mount_state "$d") == none ]] || die "could not clear the stale mount at $d; try: $FUSERMOUNT -uz $d"
+}
+
+# A packed environment leaves a marker and a couple of stub files behind, so
+# "is anything here" is not enough to tell a live environment from a packed
+# mountpoint.  While the image is mounted it shadows the marker, which is what
+# we want: a mounted environment reads as live.
+is_sealed() { [[ -f "$1/.conda-squash-sealed" ]]; }
+is_live() {
+    is_sealed "$1" && return 1
+    [[ -n "$(ls -A "$1" 2>/dev/null)" ]]
+}
+
+# A packed-but-unmounted environment should fail with an explanation rather
+# than a bare "command not found".  The mounted image shadows all of this.
+make_mountpoint() {
+    local prefix=$1 name=$2 image=$3
+    mkdir -p "$prefix/bin" || return 1
+    printf '#!/bin/sh\necho "conda-squash: environment %s is packed but not mounted." >&2\necho "  run: conda-squash mount %s" >&2\nexit 127\n' \
+        "$name" "$name" > "$prefix/bin/.conda-squash-stub" || return 1
+    chmod +x "$prefix/bin/.conda-squash-stub" || return 1
+    printf 'packed by conda-squash; image: %s\nmount with: conda-squash mount %s\n' \
+        "$image" "$name" > "$prefix/NOT-MOUNTED.txt" || return 1
+    : > "$prefix/.conda-squash-sealed"
+}
+
+# Deleting an environment is a rename to a sibling trash directory, then the
+# mountpoint, then the actual delete.  The rename is atomic, so an interrupt
+# leaves either the whole environment or a finished mountpoint, never half of
+# one.  Leftovers of an interrupted run are cleared by the next command on
+# that environment, once the process that made them is gone.
+leftover_path() {                  # kind prefix
+    printf '%s/.conda-squash-%s.%s.%s.%s\n' "$(dirname "$2")" "$1" "${2##*/}" "$HOST" "$$"
+}
+
+clean_leftovers() {
+    local prefix=$1 t pid
+    for t in "$(dirname "$prefix")/.conda-squash-"{trash,unpack}".${prefix##*/}.$HOST".*; do
+        [[ -e $t ]] || continue
+        pid=${t##*.}
+        [[ -d /proc/$pid ]] && continue
+        info "removing leftovers of an interrupted $PROG run: $t"
+        rm -rf "$t"
+    done
+    return 0
+}
+
+# ---------------------------------------------------------------- processes --
+# PIDs on this node with a file, executable, mapping or working directory under
+# $1.  Only processes we are allowed to inspect are seen, which covers the
+# caller's own.  Other nodes are invisible from here.
+pids_using() {
+    local prefix=$1 d pid seen
+    for d in /proc/[0-9]*; do
+        pid=${d#/proc/}
+        [[ $pid == "$$" || $pid == "$BASHPID" ]] && continue
+        # Every source ends its line with a path.  Suffixing "/" lets one
+        # match catch the prefix itself (a cwd at the env root) as well as
+        # anything under it, without matching "tz" for "tz2".  Read it all
+        # rather than grep -q: an early exit SIGPIPEs the reader, and under
+        # pipefail a large maps file would then hide the process.
+        seen=$({ readlink "$d/exe"; readlink "$d/cwd"; ls -l "$d/fd"; cat "$d/maps"; } 2>/dev/null \
+                | sed 's|$|/|' || true)
+        [[ $seen == *"$prefix/"* ]] && printf '%s\n' "$pid"
+    done
+    return 0
+}
+
+proc_start() {                     # pid -> start time in clock ticks, or nonzero
+    local s
+    s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+    s=${s##*) }
+    # shellcheck disable=SC2086
+    set -- $s
+    printf '%s\n' "${20}"
+}
+
+# Shells that ran 'activate' have the environment on PATH but nothing open in
+# it, so no process scan can see them.  They register here, keyed by host, PID
+# and process start time, so a recycled PID does not count as a user.
+ref_add() {
+    local name=$1 pid=$2 st
+    st=$(proc_start "$pid") || return 0
+    mkdir -p "$REFS/$name"
+    printf '%s\n' "$st" > "$REFS/$name/$HOST.$pid"
+}
+
+ref_del() { rm -f "$REFS/$1/$HOST.$2"; }
+
+live_refs() {                      # name -> PIDs on this host with it activated
+    local name=$1 f pid st
+    [[ -d "$REFS/$name" ]] || return 0
+    for f in "$REFS/$name/$HOST".*; do
+        [[ -e $f ]] || continue
+        pid=${f##*.}
+        if st=$(proc_start "$pid") && [[ $st == "$(cat "$f")" ]]; then
+            printf '%s\n' "$pid"
+        else
+            rm -f "$f"
+        fi
+    done
+    return 0
+}
+
+# ------------------------------------------------------------ namespace run --
+# Run a command with an image mounted at a path inside a private mount
+# namespace.  squashfuse runs in the foreground as a child of the runner and is
+# unmounted on the way out: a daemonized squashfuse keeps the namespace, and
+# the image file, alive long after the command has exited.  pdeathsig takes it
+# down too if the runner itself is SIGKILLed.  Signals are caught with a no-op
+# rather than ignored, so the command still gets the default handlers and the
+# runner survives to clean up after it.
+NS_RUNNER='
+sf=$1 fm=$2 img=$3 pre=$4 pds=$5 nsname=$6; shift 6
+before=$(stat -c %d "$pre" 2>/dev/null || true)
+if [ "$pds" = 1 ]; then
+    setpriv --pdeathsig TERM "$sf" -f "$img" "$pre" &
+else
+    "$sf" -f "$img" "$pre" &
+fi
+fp=$!
+# Best-effort: either step fails harmlessly if squashfuse already exited.
+cleanup() { "$fm" -u "$pre" 2>/dev/null; kill "$fp" 2>/dev/null; wait "$fp" 2>/dev/null; }
+trap cleanup EXIT
+trap : INT TERM HUP
+# Wait for this mount specifically.  The path may already be a mount inherited
+# from the host, which would satisfy a plain mountpoint test at once.
+i=0
+while :; do
+    now=$(stat -c %d "$pre" 2>/dev/null || true)
+    [ -n "$now" ] && [ "$now" != "$before" ] && break
+    kill -0 "$fp" 2>/dev/null || { echo "conda-squash: squashfuse could not mount $img" >&2; exit 1; }
+    i=$((i + 1))
+    [ "$i" -gt 400 ] && { echo "conda-squash: timed out mounting $img" >&2; exit 1; }
+    sleep 0.05
+done
+export CONDA_SQUASH_NS="$nsname"
+"$@"
+'
+
+# With NS_EXEC=1 this process becomes the runner, so killing the PID the user
+# started takes squashfuse down with it instead of orphaning the runner.
+ns_run() {                         # image prefix name command...
+    local image=$1 prefix=$2 name=$3; shift 3
+    local cmd=(unshare -Urm --map-root-user /bin/bash -c "$NS_RUNNER" _
+               "$SQUASHFUSE" "$FUSERMOUNT" "$image" "$prefix" "$PDEATHSIG" "$name" "$@")
+    if [[ ${NS_EXEC:-0} == 1 ]]; then exec "${cmd[@]}" 7>&- 8>&-; fi
+    "${cmd[@]}" 7>&- 8>&-
+}
+
+have_userns() { unshare -Urm --map-root-user true 2>/dev/null; }
+
+# ---------------------------------------------------------------- cmd: pack --
+count_image() { "$UNSQUASHFS" -l "$1" | grep -c '^squashfs-root'; }
+
+# Mount the image over the environment inside a private namespace and run the
+# environment's python from it.  The namespace keeps the original visible to
+# everyone else, so this is safe to do before anything is deleted.
+smoke_test() {
+    local image=$1 prefix=$2 name=$3
+    have_userns || {
+        warn "no user namespaces here; skipping the in-place smoke test"
+        return 0
+    }
+    ns_run "$image" "$prefix" "$name" /bin/bash -c '
+        pre=$1
+        [ -e "$pre/.conda-squash-sealed" ] && { echo "image contains a packed mountpoint, not an environment" >&2; exit 1; }
+        [ -x "$pre/bin/python" ] || exit 0
+        "$pre/bin/python" -c "import sys; assert sys.prefix == sys.argv[1], (sys.prefix, sys.argv[1]); print(\"  python\", sys.version.split()[0], \"runs from the image\")" "$pre"
+    ' _ "$prefix"
+}
+
+fix_cuda() {
+    local prefix=$1 d nvdirs=() nvlib
+    for d in "$prefix"/lib/python*/site-packages/nvidia/*/lib; do
+        if [[ -d $d ]]; then nvdirs+=("$d"); fi
+    done
+    if [[ ${#nvdirs[@]} -eq 0 ]]; then
+        info "--fix-cuda: no nvidia/*/lib directories found, nothing to do"
+        return 0
+    fi
+    nvlib=$(IFS=:; printf '%s' "${nvdirs[*]}")
+    mkdir -p "$prefix/etc/conda/activate.d" "$prefix/etc/conda/deactivate.d"
+    # Wheel-shipped CUDA libraries are not on the loader path by default, so
+    # frameworks find the driver and then fail to dlopen their own runtime.
+    cat > "$prefix/etc/conda/activate.d/zz-conda-squash-cuda.sh" <<EOF
+# added by conda-squash --fix-cuda
+export CONDA_SQUASH_OLD_LD_LIBRARY_PATH="\${LD_LIBRARY_PATH-}"
+export LD_LIBRARY_PATH="$nvlib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+EOF
+    cat > "$prefix/etc/conda/deactivate.d/zz-conda-squash-cuda.sh" <<'EOF'
+# added by conda-squash --fix-cuda
+if [ -n "${CONDA_SQUASH_OLD_LD_LIBRARY_PATH+x}" ]; then
+    if [ -n "$CONDA_SQUASH_OLD_LD_LIBRARY_PATH" ]; then
+        export LD_LIBRARY_PATH="$CONDA_SQUASH_OLD_LD_LIBRARY_PATH"
+    else
+        unset LD_LIBRARY_PATH
+    fi
+    unset CONDA_SQUASH_OLD_LD_LIBRARY_PATH
+fi
+EOF
+    info "--fix-cuda: added ${#nvdirs[@]} CUDA wheel lib dirs to activate.d"
+}
+
+cmd_pack() {
+    local env="" to="" name="" jobs=${SLURM_CPUS_PER_TASK:-$(nproc)} comp=zstd level=15
+    local fix=0 keep=0 yes=0 force=0
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            --to)        to=$2; shift 2 ;;
+            --name)      name=$2; shift 2 ;;
+            -j|--jobs)   jobs=$2; shift 2 ;;
+            --comp)      comp=$2; shift 2 ;;
+            --level)     level=$2; shift 2 ;;
+            --fix-cuda)  fix=1; shift ;;
+            --keep)      keep=1; shift ;;
+            -y|--yes)    yes=1; shift ;;
+            --force)     force=1; shift ;;
+            -*)          die "pack: unknown option $1" ;;
+            *)           env=$1; shift ;;
+        esac
+    done
+    [[ -n "$env" ]] || die "usage: $PROG pack <env-path> [--keep] [-y] [--force] [--name N] [--to DIR] [-j N] [--fix-cuda]"
+    need MKSQUASHFS "mksquashfs"; need UNSQUASHFS "unsquashfs"
+    need SQUASHFUSE "squashfuse"; need FUSERMOUNT "fusermount"
+
+    [[ -d "$env" ]] || die "no such directory: $env"
+    local prefix image partial row
+    prefix=$(cd "$env" && pwd -P)
+    name=${name:-${prefix##*/}}
+    valid_name "$name"
+    lock_env "$name" 0
+    clean_stale "$prefix"
+    clean_leftovers "$prefix"
+    is_mounted "$prefix" && die "$prefix is a mounted image; it is already packed"
+    is_sealed "$prefix" && die "$prefix is already packed (image mountpoint)"
+    if row=$(index_get "$name") && [[ $(cut -f2 <<<"$row") != "$prefix" ]]; then
+        die "the name '$name' already belongs to $(cut -f2 <<<"$row").
+Pass --name to register this environment under a different name."
+    fi
+    [[ -f "$prefix/conda-meta/history" ]] || \
+        warn "$prefix does not look like a conda environment; packing it anyway"
+
+    # Default the image beside the environment, so it lands on the same
+    # filesystem and next to the mountpoint it will be mounted at.
+    to=${to:-${CONDA_SQUASH_IMAGES:-$(dirname "$prefix")/.squashed}}
+    mkdir -p "$to"
+    image=$(cd "$to" && pwd -P)/$name.sqfs
+    # Build under a temporary name so an interrupt, or a failed check, can
+    # never leave a truncated file where a registered image is expected.
+    partial=$image.partial.$HOST.$$
+    trap "rm -f $(printf '%q' "$partial")" EXIT
+    trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+
+    [[ $fix == 1 ]] && fix_cuda "$prefix"
+
+    local n_src n_img
+    n_src=$(find "$prefix" | wc -l)
+    info "packing $prefix ($n_src inodes) -> $image"
+    "$MKSQUASHFS" "$prefix" "$partial" -noappend -comp "$comp" \
+        -Xcompression-level "$level" -processors "$jobs" -no-progress >/dev/null 7>&- 8>&-
+
+    # An image with fewer inodes than the source would silently drop part of
+    # the environment once the original is deleted.
+    n_img=$(count_image "$partial")
+    [[ $n_img -eq $n_src ]] || die "image holds $n_img inodes but the source had $n_src -- image discarded"
+    info "image: $n_img inodes, $(du -h "$partial" | cut -f1) (source $(du -sh "$prefix" | cut -f1))"
+
+    smoke_test "$partial" "$prefix" "$name" || \
+        die "the environment does not run from its image -- image discarded, original untouched"
+    mv -f "$partial" "$image"
+    index_put "$name" "$image" "$prefix"
+
+    if [[ $keep == 1 ]]; then
+        info "kept the original (--keep). Run '$PROG pack $prefix' to replace it."
+        return 0
+    fi
+
+    local busy
+    busy=$(pids_using "$prefix" | paste -sd' ' -)
+    if [[ -n "$busy" && $force != 1 ]]; then
+        die "processes on this node are using $prefix (PIDs: $busy).
+Deleting it under them will crash them. Stop them, or pass --force.
+The image is built and registered; nothing was deleted."
+    fi
+
+    if [[ $yes != 1 ]]; then
+        [[ -t 0 ]] || die "no terminal to confirm the delete; pass -y. The image is built; nothing was deleted."
+        printf 'Delete %s (%s inodes)? Recoverable with: %s unpack %s\n' "$prefix" "$n_src" "$PROG" "$name" >&2
+        local reply
+        read -r -p "Type '$name' to confirm: " reply
+        [[ "$reply" == "$name" ]] || die "not confirmed; the image is built and nothing was deleted"
+    fi
+
+    # The environment may have changed while the image was being built and
+    # tested.  Check once more immediately before the image becomes the only copy.
+    n_src=$(find "$prefix" | wc -l)
+    [[ $n_src -eq $n_img ]] || die "$prefix changed during packing ($n_img -> $n_src inodes); run pack again"
+
+    local trash
+    trash=$(leftover_path trash "$prefix")
+    trap '' INT TERM HUP
+    mv "$prefix" "$trash"
+    if ! make_mountpoint "$prefix" "$name" "$image"; then
+        rm -rf "$prefix"
+        mv "$trash" "$prefix"
+        die "could not create the mountpoint at $prefix; the environment was put back"
+    fi
+    trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+
+    info "removing the original ..."
+    rm -rf "$trash" || warn "could not fully remove $trash; the environment is packed, delete that by hand"
+    info "packed $name: $n_src inodes -> $(find "$prefix" "$image" | wc -l)"
+    info "use it with: $PROG mount $name   or   $PROG exec $name -- <cmd>"
+}
+
+# -------------------------------------------------------------- cmd: mount --
+cmd_mount() {
+    local name=${1:?usage: $PROG mount <name>}
+    not_in_exec mount
+    need SQUASHFUSE "squashfuse"; need FUSERMOUNT "fusermount"
+    resolve "$name"
+    lock_env "$name" 60
+    clean_stale "$PREFIX"
+    if [[ $(mount_state "$PREFIX") == mounted ]]; then info "already mounted: $PREFIX"; return 0; fi
+    clean_leftovers "$PREFIX"
+    if is_live "$PREFIX"; then
+        die "the original environment is still at $PREFIX (packed with --keep).
+Mounting over it would shadow it for every process on this node.
+Use '$PROG exec $name -- <cmd>' to try the image, or '$PROG pack $PREFIX' to replace the original."
+    fi
+    mkdir -p "$PREFIX"
+    "$SQUASHFUSE" "$IMAGE" "$PREFIX" </dev/null >/dev/null 7>&- 8>&-
+    [[ $(mount_state "$PREFIX") == mounted ]] || die "squashfuse exited cleanly but nothing is mounted at $PREFIX"
+    info "mounted $name at $PREFIX"
+}
+
+cmd_umount() {
+    local name="" force=0
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -f|--force) force=1; shift ;;
+            -*)         die "umount: unknown option $1" ;;
+            *)          name=$1; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "usage: $PROG umount <name> [--force]"
+    not_in_exec umount
+    need FUSERMOUNT "fusermount"
+    resolve "$name" allow-missing
+    lock_env "$name" 60
+    clean_stale "$PREFIX"
+    if [[ $(mount_state "$PREFIX") != mounted ]]; then info "not mounted: $PREFIX"; return 0; fi
+
+    # The kernel refuses to unmount while files are open in the mount, but a
+    # shell that only has the environment on PATH holds nothing open and would
+    # find it gone on its next command.  Check for both, to say who is using it.
+    if [[ $force != 1 ]]; then
+        local refs busy
+        refs=$(live_refs "$name" | paste -sd' ' -)
+        busy=$(pids_using "$PREFIX" | paste -sd' ' -)
+        if [[ -n $refs || -n $busy ]]; then
+            die "'$name' is still in use on this node:
+${busy:+  processes running from it: $busy
+}${refs:+  shells with it activated: $refs (in each: eval \"\$($PROG deactivate)\")
+}Unmounting now would break them. Stop them, or pass --force."
+        fi
+        "$FUSERMOUNT" -u "$PREFIX" || die "$PREFIX is busy: something on this node still has files open in it.
+Stop it, or pass --force."
+    else
+        # Lazy: the path is detached now, and programs already inside keep
+        # what they have open until they exit.
+        "$FUSERMOUNT" -uz "$PREFIX"
+    fi
+    [[ $(mount_state "$PREFIX") == none ]] || die "$PREFIX is still mounted after unmounting"
+    rm -f "$REFS/$name/$HOST".*
+    info "unmounted $name"
+}
+
+# --------------------------------------------------------------- cmd: exec --
+# Mount inside a private mount namespace and run one command.  The mount is
+# torn down with the command, so nothing is left behind and nothing is visible
+# to anyone else - the right mode for one-offs, for shared environments, and
+# for batch jobs that may be killed.
+cmd_exec() {
+    local name=${1:?usage: $PROG exec <name> [--] <command>...}; shift
+    [[ ${1:-} == -- ]] && shift
+    [[ $# -gt 0 ]] || die "usage: $PROG exec <name> [--] <command>..."
+    need SQUASHFUSE "squashfuse"; need FUSERMOUNT "fusermount"
+    resolve "$name"
+
+    local run state
+    run="$(env_snippet "$PREFIX" "$name")"$'\n''exec "$@"'
+    state=$(mount_state "$PREFIX")
+    if [[ $state == stale ]]; then
+        lock_env "$name" 60
+        clean_stale "$PREFIX"
+        unlock_env
+        state=$(mount_state "$PREFIX")
+    fi
+    # Already mounted on this node, or inside an exec of this environment.
+    if [[ $state == mounted ]] && is_live "$PREFIX"; then
+        exec /bin/bash -c "$run" _ "$@"
+    fi
+
+    have_userns || die "unprivileged user namespaces are unavailable, so '$PROG exec' cannot work here.
+Use '$PROG mount $name' instead, and unmount when you are done."
+    # If the original is still there (--keep), the image shadows it only
+    # inside the namespace, which is exactly what trying the image needs.
+    [[ $state == none ]] && mkdir -p "$PREFIX"
+    NS_EXEC=1 ns_run "$IMAGE" "$PREFIX" "$name" /bin/bash -c "$run" _ "$@"
+}
+
+cmd_shell() {
+    local name=${1:?usage: $PROG shell <name>}
+    cmd_exec "$name" -- "${SHELL:-/bin/bash}"
+}
+
+# ----------------------------------------------------------- cmd: activate --
+# What being inside the environment means: the variables conda would set, and
+# the environment's own activation hooks.
+env_snippet() {
+    local prefix=$1 name=$2
+    cat <<EOF
+export CONDA_PREFIX=$(printf '%q' "$prefix")
+export CONDA_DEFAULT_ENV=$(printf '%q' "$name")
+export PATH="\$CONDA_PREFIX/bin:\$PATH"
+for _cs_f in "\$CONDA_PREFIX"/etc/conda/activate.d/*.sh; do
+    [ -e "\$_cs_f" ] && . "\$_cs_f"
+done
+unset _cs_f
+EOF
+}
+
+# Emits shell code; meant to be used as:  eval "$(conda-squash activate tz)"
+cmd_activate() {
+    local name=${1:?usage: eval \"\$($PROG activate <name>)\"}
+    resolve "$name"
+    local self_q; self_q=$(printf '%q' "$SELF")
+
+    if [[ ${CONDA_SQUASH_ACTIVE:-} == "$name" ]]; then
+        # Already active here.  Only make sure this shell is registered - it
+        # may be a child that inherited the environment from its parent.
+        printf '%s _ref add %q "$$"\n' "$self_q" "$name"
+        return 0
+    fi
+    # Mount here rather than emitting shell to do it, so a failure is reported
+    # by this process instead of being eval'd into the caller's shell.
+    if ! { [[ $(mount_state "$PREFIX") == mounted ]] && is_live "$PREFIX"; }; then
+        QUIET=1 cmd_mount "$name"
+        unlock_env
+    fi
+    # Register the calling shell now, so an umount cannot slip in between
+    # this mount and the eval.  The emitted line registers it again by its own
+    # $$, in case the caller ran this from a subshell.
+    ref_add "$name" "$PPID"
+    [[ -n ${CONDA_SQUASH_ACTIVE:-} ]] && cmd_deactivate
+    printf 'export CONDA_SQUASH_OLD_PATH="${CONDA_SQUASH_OLD_PATH-$PATH}"\n'
+    printf 'export CONDA_SQUASH_ACTIVE=%q\n' "$name"
+    env_snippet "$PREFIX" "$name"
+    printf '%s _ref add %q "$$"\n' "$self_q" "$name"
+}
+
+cmd_deactivate() {
+    local name=${CONDA_SQUASH_ACTIVE:-}
+    if [[ -z $name ]]; then echo ':'; return 0; fi
+    cat <<'EOF'
+for _cs_f in "$CONDA_PREFIX"/etc/conda/deactivate.d/*.sh; do
+    [ -e "$_cs_f" ] && . "$_cs_f"
+done
+unset _cs_f
+[ -n "${CONDA_SQUASH_OLD_PATH+x}" ] && export PATH="$CONDA_SQUASH_OLD_PATH"
+EOF
+    printf '%q _ref del %q "$$"\n' "$SELF" "$name"
+    echo 'unset CONDA_SQUASH_OLD_PATH CONDA_SQUASH_ACTIVE CONDA_PREFIX CONDA_DEFAULT_ENV'
+}
+
+cmd__ref() {
+    case ${1:-} in
+        add) ref_add "${2:?}" "${3:?}" ;;
+        del) ref_del "${2:?}" "${3:?}" ;;
+        *)   die "internal: _ref add|del <name> <pid>" ;;
+    esac
+}
+
+# -------------------------------------------------------------- cmd: unpack --
+cmd_unpack() {
+    local name=${1:?usage: $PROG unpack <name>}
+    not_in_exec unpack
+    need UNSQUASHFS "unsquashfs"
+    resolve "$name"
+    lock_env "$name" 0
+    clean_stale "$PREFIX"
+    is_mounted "$PREFIX" && die "unmount first: $PROG umount $name"
+    clean_leftovers "$PREFIX"
+    is_live "$PREFIX" && die "$PREFIX already holds files; move them aside first"
+
+    # Restore beside the mountpoint and swap it in only once complete, so an
+    # interrupt never leaves a partial environment at the real path.
+    local tmp n_img n_tmp
+    tmp=$(leftover_path unpack "$PREFIX")
+    trap "rm -rf $(printf '%q' "$tmp")" EXIT
+    trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+    info "restoring $name ..."
+    "$UNSQUASHFS" -d "$tmp" "$IMAGE" >/dev/null 7>&- 8>&-
+    n_img=$(count_image "$IMAGE"); n_tmp=$(find "$tmp" | wc -l)
+    [[ $n_tmp -eq $n_img ]] || die "restored copy has $n_tmp inodes but the image has $n_img; nothing changed"
+
+    trap '' INT TERM HUP
+    rm -rf "$PREFIX"
+    mv "$tmp" "$PREFIX"
+    trap - INT TERM HUP
+    info "restored $name to $PREFIX ($n_tmp inodes)"
+    info "the image is still at $IMAGE; remove it and run '$PROG forget $name' when you are sure"
+}
+
+cmd_forget() {
+    local name="" force=0 row image prefix
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -f|--force) force=1; shift ;;
+            -*)         die "forget: unknown option $1" ;;
+            *)          name=$1; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "usage: $PROG forget <name> [--force]"
+    row=$(index_get "$name") || die "'$name' is not in the index"
+    image=$(cut -f1 <<<"$row"); prefix=$(cut -f2 <<<"$row")
+    lock_env "$name" 60
+    is_mounted "$prefix" && die "'$name' is mounted on this node; unmount it first"
+    if [[ $force != 1 ]] && is_sealed "$prefix" && [[ -f $image ]]; then
+        die "'$name' is packed: $image is the only copy of the environment, and
+forgetting it leaves $prefix as a bare mountpoint. Run '$PROG unpack $name' first, or pass --force."
+    fi
+    index_del "$name"
+    rm -rf "${REFS:?}/$name"
+    info "forgot $name"
+}
+
+# --------------------------------------------------------------- cmd: list --
+cmd_list() {
+    local idx; idx=$(index_file)
+    [[ -s "$idx" ]] || { info "nothing packed yet"; return 0; }
+    printf '%-20s %-10s %-9s %s\n' NAME SIZE STATE PREFIX
+    local name image prefix state size
+    while IFS=$'\t' read -r name image prefix; do
+        state=$(mount_state "$prefix")
+        if   [[ ! -f "$image" ]];   then state=MISSING
+        elif [[ $state == stale ]]; then :
+        elif [[ $state == mounted ]]; then :
+        elif is_live "$prefix";     then state=kept
+        else                             state=packed
+        fi
+        size=$([[ -f "$image" ]] && du -h "$image" | cut -f1 || echo -)
+        printf '%-20s %-10s %-9s %s\n' "$name" "$size" "$state" "$prefix"
+    done < "$idx"
+}
+
+# ------------------------------------------------------------- cmd: verify --
+cmd_verify() {
+    local name=${1:?usage: $PROG verify <name>}
+    resolve "$name"
+    info "verifying $name ..."
+    ( cmd_exec "$name" -- /bin/bash -c '
+        set -e
+        [ -x "$CONDA_PREFIX/bin/python" ] || { echo "no python in env"; exit 0; }
+        "$CONDA_PREFIX/bin/python" - <<PY
+import sys
+print("  python", sys.version.split()[0], "prefix", sys.prefix)
+PY
+    ' ) || die "verification failed"
+    info "ok"
+}
+
+cmd_doctor() {
+    printf '%s %s\n\n' "$PROG" "$VERSION"
+    printf '%-14s %s\n' squashfuse  "${SQUASHFUSE:-NOT FOUND}"
+    printf '%-14s %s\n' mksquashfs  "${MKSQUASHFS:-NOT FOUND}"
+    printf '%-14s %s\n' unsquashfs  "${UNSQUASHFS:-NOT FOUND}"
+    printf '%-14s %s\n' fusermount  "${FUSERMOUNT:-NOT FOUND}"
+    printf '%-14s %s\n' flock       "${FLOCK:-NOT FOUND}"
+    printf '%-14s %s\n' registry    "$REGISTRY"
+    if have_userns; then
+        printf '%-14s yes (conda-squash exec available)\n' 'user ns'
+    else
+        printf '%-14s no (use mount/umount instead of exec)\n' 'user ns'
+    fi
+    if [[ $PDEATHSIG == 1 ]]; then
+        printf '%-14s yes (exec cleans up even if killed)\n' pdeathsig
+    else
+        printf '%-14s no (a SIGKILLed exec can leave a squashfuse process behind)\n' pdeathsig
+    fi
+    if [[ -r /etc/fuse.conf ]] && grep -qE '^\s*user_allow_other' /etc/fuse.conf; then
+        printf '%-14s yes (mounts can be shared with other users)\n' allow_other
+    else
+        printf '%-14s no (each user must mount for themselves)\n' allow_other
+    fi
+}
+
+usage() {
+    cat <<EOF
+$PROG $VERSION - collapse a conda environment into a single squashfs image
+
+  $PROG pack <env-path> [--keep] [-y] [--force] [--name N] [--to DIR] [-j N] [--fix-cuda]
+        Build <name>.sqfs, check it holds every inode, run the environment's
+        python from the mounted image, then delete the original.
+          --keep    stop before deleting
+          -y        do not prompt before deleting
+          --force   delete even if processes on this node are using the env
+          --name    register under a name other than the directory's
+  $PROG unpack <name>
+        Restore the environment from its image. The way back out.
+
+  $PROG mount <name> / umount <name> [--force]
+        Mount the image at the environment's original path, for this node.
+        umount refuses while processes or activated shells are using it.
+  $PROG exec <name> -- <cmd>...
+        Run one command with the image mounted in a private namespace.
+  $PROG shell <name>
+        An interactive shell in the environment.
+  eval "\$($PROG activate <name>)"   /   eval "\$($PROG deactivate)"
+        Put the environment on PATH in the current shell, mounting it if needed.
+
+  $PROG list / verify <name> / forget <name> [--force] / doctor
+
+Environment:
+  CONDA_SQUASH_IMAGES     where images go (default: <env-parent>/.squashed)
+  CONDA_SQUASH_REGISTRY   index, locks and activation records
+                          (default: ~/.local/share/conda-squash)
+EOF
+}
+
+case ${1:-} in
+    pack)       shift; cmd_pack "$@" ;;
+    unpack)     shift; cmd_unpack "$@" ;;
+    mount)      shift; cmd_mount "$@" ;;
+    umount|unmount) shift; cmd_umount "$@" ;;
+    exec)       shift; cmd_exec "$@" ;;
+    shell)      shift; cmd_shell "$@" ;;
+    activate)   shift; cmd_activate "$@" ;;
+    deactivate) shift; cmd_deactivate "$@" ;;
+    list|ls)    shift; cmd_list "$@" ;;
+    verify)     shift; cmd_verify "$@" ;;
+    forget)     shift; cmd_forget "$@" ;;
+    doctor)     shift; cmd_doctor "$@" ;;
+    _ref)       shift; cmd__ref "$@" ;;
+    -V|--version) echo "$PROG $VERSION" ;;
+    ""|-h|--help) usage ;;
+    *)          die "unknown command '$1' (try: $PROG --help)" ;;
+esac
