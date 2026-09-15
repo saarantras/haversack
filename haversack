@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# conda-squash - collapse a conda environment into a single squashfs image.
+# haversack - collapse a conda environment into a single squashfs image.
 #
 # An environment full of small files is expensive on a shared filesystem: it
 # burns inode quota and every import is a burst of metadata round-trips.  This
@@ -8,13 +8,15 @@
 # it behaves exactly as it did before - only faster, and one file instead of
 # tens of thousands.
 #
-# https://github.com/saarantras/conda-squash
+# https://github.com/saarantras/haversack
 set -euo pipefail
 
 VERSION=0.1.0
 PROG=${0##*/}
 SELF=$(readlink -f "$0")
-HOST=${HOSTNAME%%.*}
+# Not $HOSTNAME: bash keeps an inherited value, and Slurm jobs inherit the
+# submitting host's.  Records keyed by host must name the node they are on.
+HOST=$(uname -n); HOST=${HOST%%.*}
 
 # ---------------------------------------------------------------- discovery --
 # squashfuse and mksquashfs are often present only inside an Apptainer or
@@ -55,7 +57,7 @@ FLOCK=$(command -v flock || true)
 PDEATHSIG=0
 [[ $(setpriv --help 2>&1 || true) == *--pdeathsig* ]] && PDEATHSIG=1
 
-REGISTRY=${CONDA_SQUASH_REGISTRY:-${XDG_DATA_HOME:-$HOME/.local/share}/conda-squash}
+REGISTRY=${HAVERSACK_REGISTRY:-${XDG_DATA_HOME:-$HOME/.local/share}/haversack}
 LOCKS=$REGISTRY/locks
 REFS=$REGISTRY/refs
 
@@ -69,11 +71,11 @@ need() {
 or run somewhere Apptainer/Singularity is installed (it bundles squashfuse and mksquashfs)."
 }
 
-# Inside 'conda-squash exec' the mount table is private and disappears with the
+# Inside 'haversack exec' the mount table is private and disappears with the
 # command, so changing mounts from in there would only confuse things - and a
 # squashfuse started there would keep the namespace alive after exit.
 not_in_exec() {
-    [[ -z ${CONDA_SQUASH_NS:-} ]] || die "this shell is inside '$PROG exec ${CONDA_SQUASH_NS}', \
+    [[ -z ${HAVERSACK_NS:-} ]] || die "this shell is inside '$PROG exec ${HAVERSACK_NS}', \
 where mounts are private and temporary. Run '$PROG $1' from outside it."
 }
 
@@ -175,23 +177,49 @@ clean_stale() {
 # "is anything here" is not enough to tell a live environment from a packed
 # mountpoint.  While the image is mounted it shadows the marker, which is what
 # we want: a mounted environment reads as live.
-is_sealed() { [[ -f "$1/.conda-squash-sealed" ]]; }
+is_sealed() { [[ -f "$1/.haversack-sealed" ]]; }
 is_live() {
     is_sealed "$1" && return 1
     [[ -n "$(ls -A "$1" 2>/dev/null)" ]]
 }
 
-# A packed-but-unmounted environment should fail with an explanation rather
-# than a bare "command not found".  The mounted image shadows all of this.
+# The environment's path while its image is not mounted there.  Jobs and conda
+# still reach for it, so every way in fails loudly instead of quietly doing the
+# wrong thing:
+#  - bin/ has a stub under every executable name the environment had, all
+#    hardlinks to one file, so `python` says what to run rather than falling
+#    through to whatever python is next on PATH;
+#  - an activate.d hook warns anyone who activates the environment;
+#  - conda-meta is a file, not a directory, so `conda create` or `install`
+#    aimed at this name refuses instead of writing into the mountpoint.  conda
+#    only lists directories with conda-meta/history, so `conda env list` still
+#    shows the environment only where it is mounted.
+# The mounted image shadows all of it.
 make_mountpoint() {
-    local prefix=$1 name=$2 image=$3
-    mkdir -p "$prefix/bin" || return 1
-    printf '#!/bin/sh\necho "conda-squash: environment %s is packed but not mounted." >&2\necho "  run: conda-squash mount %s" >&2\nexit 127\n' \
-        "$name" "$name" > "$prefix/bin/.conda-squash-stub" || return 1
-    chmod +x "$prefix/bin/.conda-squash-stub" || return 1
-    printf 'packed by conda-squash; image: %s\nmount with: conda-squash mount %s\n' \
+    local prefix=$1 name=$2 image=$3 stub n
+    stub=$prefix/bin/.haversack-stub
+    mkdir -p "$prefix/bin" "$prefix/etc/conda/activate.d" || return 1
+    printf '#!/bin/sh\necho "haversack: %s is packed but not mounted on this node, so ${0##*/} cannot run." >&2\necho "  in a batch job: haversack exec %s -- <cmd>    interactively: haversack mount %s" >&2\nexit 127\n' \
+        "$name" "$name" "$name" > "$stub" || return 1
+    chmod +x "$stub" || return 1
+    while IFS= read -r n; do
+        [[ -n $n && $n != .haversack-stub ]] || continue
+        # A hardlink costs no inode; fall back to a symlink where they are not allowed.
+        ln -f "$stub" "$prefix/bin/$n" 2>/dev/null || ln -sf .haversack-stub "$prefix/bin/$n" || return 1
+    done < <("$UNSQUASHFS" -l "$image" | sed -n 's|^squashfs-root/bin/\([^/]*\)$|\1|p')
+    printf 'echo "haversack: %s is packed but not mounted on this node; nothing in it will run." >&2\necho "  in a batch job: haversack exec %s -- <cmd>    interactively: haversack mount %s" >&2\n' \
+        "$name" "$name" "$name" > "$prefix/etc/conda/activate.d/00-haversack-not-mounted.sh" || return 1
+    printf 'packed by haversack and not mounted here; image: %s\n' "$image" > "$prefix/conda-meta" || return 1
+    printf 'packed by haversack; image: %s\nmount with: haversack mount %s\n' \
         "$image" "$name" > "$prefix/NOT-MOUNTED.txt" || return 1
-    : > "$prefix/.conda-squash-sealed"
+    : > "$prefix/.haversack-sealed"
+}
+
+# After a rebuild the executable names may have changed; the stubs follow the
+# new image.  The directory itself stays, so a mount of it elsewhere is untouched.
+refresh_mountpoint() {             # prefix name image
+    find "$1" -mindepth 1 -delete
+    make_mountpoint "$1" "$2" "$3" || die "the new image is in place, but the mountpoint at $1 could not be rebuilt"
 }
 
 # Deleting an environment is a rename to a sibling trash directory, then the
@@ -200,12 +228,12 @@ make_mountpoint() {
 # one.  Leftovers of an interrupted run are cleared by the next command on
 # that environment, once the process that made them is gone.
 leftover_path() {                  # kind prefix
-    printf '%s/.conda-squash-%s.%s.%s.%s\n' "$(dirname "$2")" "$1" "${2##*/}" "$HOST" "$$"
+    printf '%s/.haversack-%s.%s.%s.%s\n' "$(dirname "$2")" "$1" "${2##*/}" "$HOST" "$$"
 }
 
 clean_leftovers() {
     local prefix=$1 t pid
-    for t in "$(dirname "$prefix")/.conda-squash-"{trash,unpack}".${prefix##*/}.$HOST".*; do
+    for t in "$(dirname "$prefix")/.haversack-"{trash,unpack}".${prefix##*/}.$HOST".*; do
         [[ -e $t ]] || continue
         pid=${t##*.}
         [[ -d /proc/$pid ]] && continue
@@ -299,12 +327,12 @@ i=0
 while :; do
     now=$(stat -c %d "$pre" 2>/dev/null || true)
     [ -n "$now" ] && [ "$now" != "$before" ] && break
-    kill -0 "$fp" 2>/dev/null || { echo "conda-squash: squashfuse could not mount $img" >&2; exit 1; }
+    kill -0 "$fp" 2>/dev/null || { echo "haversack: squashfuse could not mount $img" >&2; exit 1; }
     i=$((i + 1))
-    [ "$i" -gt 400 ] && { echo "conda-squash: timed out mounting $img" >&2; exit 1; }
+    [ "$i" -gt 400 ] && { echo "haversack: timed out mounting $img" >&2; exit 1; }
     sleep 0.05
 done
-export CONDA_SQUASH_NS="$nsname"
+export HAVERSACK_NS="$nsname"
 "$@"
 '
 
@@ -334,46 +362,80 @@ smoke_test() {
     }
     ns_run "$image" "$prefix" "$name" /bin/bash -c '
         pre=$1
-        [ -e "$pre/.conda-squash-sealed" ] && { echo "image contains a packed mountpoint, not an environment" >&2; exit 1; }
+        [ -e "$pre/.haversack-sealed" ] && { echo "image contains a packed mountpoint, not an environment" >&2; exit 1; }
         [ -x "$pre/bin/python" ] || exit 0
         "$pre/bin/python" -c "import sys; assert sys.prefix == sys.argv[1], (sys.prefix, sys.argv[1]); print(\"  python\", sys.version.split()[0], \"runs from the image\")" "$pre"
     ' _ "$prefix"
 }
 
-fix_cuda() {
-    local prefix=$1 d nvdirs=() nvlib
-    for d in "$prefix"/lib/python*/site-packages/nvidia/*/lib; do
-        if [[ -d $d ]]; then nvdirs+=("$d"); fi
+fix_cuda() {                       # src prefix: the files are in src, and will live at prefix
+    local src=$1 prefix=$2 d nvdirs=() nvlib
+    for d in "$src"/lib/python*/site-packages/nvidia/*/lib; do
+        if [[ -d $d ]]; then nvdirs+=("$prefix${d#"$src"}"); fi
     done
     if [[ ${#nvdirs[@]} -eq 0 ]]; then
         info "--fix-cuda: no nvidia/*/lib directories found, nothing to do"
         return 0
     fi
     nvlib=$(IFS=:; printf '%s' "${nvdirs[*]}")
-    mkdir -p "$prefix/etc/conda/activate.d" "$prefix/etc/conda/deactivate.d"
+    mkdir -p "$src/etc/conda/activate.d" "$src/etc/conda/deactivate.d"
     # Wheel-shipped CUDA libraries are not on the loader path by default, so
     # frameworks find the driver and then fail to dlopen their own runtime.
-    cat > "$prefix/etc/conda/activate.d/zz-conda-squash-cuda.sh" <<EOF
-# added by conda-squash --fix-cuda
-export CONDA_SQUASH_OLD_LD_LIBRARY_PATH="\${LD_LIBRARY_PATH-}"
+    cat > "$src/etc/conda/activate.d/zz-haversack-cuda.sh" <<EOS
+# added by haversack --fix-cuda
+export HAVERSACK_OLD_LD_LIBRARY_PATH="\${LD_LIBRARY_PATH-}"
 export LD_LIBRARY_PATH="$nvlib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
-EOF
-    cat > "$prefix/etc/conda/deactivate.d/zz-conda-squash-cuda.sh" <<'EOF'
-# added by conda-squash --fix-cuda
-if [ -n "${CONDA_SQUASH_OLD_LD_LIBRARY_PATH+x}" ]; then
-    if [ -n "$CONDA_SQUASH_OLD_LD_LIBRARY_PATH" ]; then
-        export LD_LIBRARY_PATH="$CONDA_SQUASH_OLD_LD_LIBRARY_PATH"
+EOS
+    cat > "$src/etc/conda/deactivate.d/zz-haversack-cuda.sh" <<'EOS'
+# added by haversack --fix-cuda
+if [ -n "${HAVERSACK_OLD_LD_LIBRARY_PATH+x}" ]; then
+    if [ -n "$HAVERSACK_OLD_LD_LIBRARY_PATH" ]; then
+        export LD_LIBRARY_PATH="$HAVERSACK_OLD_LD_LIBRARY_PATH"
     else
         unset LD_LIBRARY_PATH
     fi
-    unset CONDA_SQUASH_OLD_LD_LIBRARY_PATH
+    unset HAVERSACK_OLD_LD_LIBRARY_PATH
 fi
-EOF
+EOS
     info "--fix-cuda: added ${#nvdirs[@]} CUDA wheel lib dirs to activate.d"
 }
 
+# Heavy work - conda solves, compression - belongs in a job on a cluster, not
+# on a shared login node.  Say so rather than refuse: not every site is a
+# cluster, and not every cluster forbids it.
+warn_if_login_node() {
+    if command -v sbatch >/dev/null 2>&1 && [[ -z ${SLURM_JOB_ID:-} ]]; then
+        warn "this looks like a Slurm login node, and '$1' does real work here. Consider running it inside an allocation (salloc)."
+    fi
+    return 0
+}
+
+# Pack src into image for an environment that lives at prefix: under a
+# temporary name, check the image holds every inode, run the environment's
+# python from it at prefix, and only then move it into place.  src is prefix
+# itself when packing an existing environment, or a node-local build.
+# Sets BUILT_INODES.
+build_image() {                    # src prefix name image jobs comp level
+    local src=$1 prefix=$2 name=$3 image=$4 jobs=$5 comp=$6 level=$7 partial n_src n_img
+    partial=$image.partial.$HOST.$$
+    CLEANUP+=("$partial")
+    n_src=$(find "$src" | wc -l)
+    info "packing $name ($n_src inodes) -> $image"
+    "$MKSQUASHFS" "$src" "$partial" -noappend -comp "$comp" \
+        -Xcompression-level "$level" -processors "$jobs" -no-progress >/dev/null 7>&- 8>&-
+    # An image with fewer inodes than the source would silently drop part of
+    # the environment once the original is gone.
+    n_img=$(count_image "$partial")
+    [[ $n_img -eq $n_src ]] || die "image holds $n_img inodes but the source had $n_src -- image discarded"
+    info "image: $n_img inodes, $(du -h "$partial" | cut -f1) (source $(du -sh "$src" | cut -f1))"
+    smoke_test "$partial" "$prefix" "$name" || \
+        die "the environment does not run from its image -- image discarded, nothing else changed"
+    mv -f "$partial" "$image"
+    BUILT_INODES=$n_img
+}
+
 cmd_pack() {
-    local env="" to="" name="" jobs=${SLURM_CPUS_PER_TASK:-$(nproc)} comp=zstd level=15
+    local env="" to="" name="" jobs=${SLURM_CPUS_PER_TASK:-$(nproc)} comp=zstd level=8
     local fix=0 keep=0 yes=0 force=0
     while [[ $# -gt 0 ]]; do
         case $1 in
@@ -393,9 +455,10 @@ cmd_pack() {
     [[ -n "$env" ]] || die "usage: $PROG pack <env-path> [--keep] [-y] [--force] [--name N] [--to DIR] [-j N] [--fix-cuda]"
     need MKSQUASHFS "mksquashfs"; need UNSQUASHFS "unsquashfs"
     need SQUASHFUSE "squashfuse"; need FUSERMOUNT "fusermount"
+    warn_if_login_node pack
 
     [[ -d "$env" ]] || die "no such directory: $env"
-    local prefix image partial row
+    local prefix image row
     prefix=$(cd "$env" && pwd -P)
     name=${name:-${prefix##*/}}
     valid_name "$name"
@@ -413,32 +476,12 @@ Pass --name to register this environment under a different name."
 
     # Default the image beside the environment, so it lands on the same
     # filesystem and next to the mountpoint it will be mounted at.
-    to=${to:-${CONDA_SQUASH_IMAGES:-$(dirname "$prefix")/.squashed}}
+    to=${to:-${HAVERSACK_IMAGES:-$(dirname "$prefix")/.haversack}}
     mkdir -p "$to"
     image=$(cd "$to" && pwd -P)/$name.sqfs
-    # Build under a temporary name so an interrupt, or a failed check, can
-    # never leave a truncated file where a registered image is expected.
-    partial=$image.partial.$HOST.$$
-    trap "rm -f $(printf '%q' "$partial")" EXIT
-    trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
 
-    [[ $fix == 1 ]] && fix_cuda "$prefix"
-
-    local n_src n_img
-    n_src=$(find "$prefix" | wc -l)
-    info "packing $prefix ($n_src inodes) -> $image"
-    "$MKSQUASHFS" "$prefix" "$partial" -noappend -comp "$comp" \
-        -Xcompression-level "$level" -processors "$jobs" -no-progress >/dev/null 7>&- 8>&-
-
-    # An image with fewer inodes than the source would silently drop part of
-    # the environment once the original is deleted.
-    n_img=$(count_image "$partial")
-    [[ $n_img -eq $n_src ]] || die "image holds $n_img inodes but the source had $n_src -- image discarded"
-    info "image: $n_img inodes, $(du -h "$partial" | cut -f1) (source $(du -sh "$prefix" | cut -f1))"
-
-    smoke_test "$partial" "$prefix" "$name" || \
-        die "the environment does not run from its image -- image discarded, original untouched"
-    mv -f "$partial" "$image"
+    [[ $fix == 1 ]] && fix_cuda "$prefix" "$prefix"
+    build_image "$prefix" "$prefix" "$name" "$image" "$jobs" "$comp" "$level"
     index_put "$name" "$image" "$prefix"
 
     if [[ $keep == 1 ]]; then
@@ -456,7 +499,7 @@ The image is built and registered; nothing was deleted."
 
     if [[ $yes != 1 ]]; then
         [[ -t 0 ]] || die "no terminal to confirm the delete; pass -y. The image is built; nothing was deleted."
-        printf 'Delete %s (%s inodes)? Recoverable with: %s unpack %s\n' "$prefix" "$n_src" "$PROG" "$name" >&2
+        printf 'Delete %s (%s inodes)? Recoverable with: %s unpack %s\n' "$prefix" "$BUILT_INODES" "$PROG" "$name" >&2
         local reply
         read -r -p "Type '$name' to confirm: " reply
         [[ "$reply" == "$name" ]] || die "not confirmed; the image is built and nothing was deleted"
@@ -464,8 +507,9 @@ The image is built and registered; nothing was deleted."
 
     # The environment may have changed while the image was being built and
     # tested.  Check once more immediately before the image becomes the only copy.
-    n_src=$(find "$prefix" | wc -l)
-    [[ $n_src -eq $n_img ]] || die "$prefix changed during packing ($n_img -> $n_src inodes); run pack again"
+    local n_now
+    n_now=$(find "$prefix" | wc -l)
+    [[ $n_now -eq $BUILT_INODES ]] || die "$prefix changed during packing ($BUILT_INODES -> $n_now inodes); run pack again"
 
     local trash
     trash=$(leftover_path trash "$prefix")
@@ -480,8 +524,243 @@ The image is built and registered; nothing was deleted."
 
     info "removing the original ..."
     rm -rf "$trash" || warn "could not fully remove $trash; the environment is packed, delete that by hand"
-    info "packed $name: $n_src inodes -> $(find "$prefix" "$image" | wc -l)"
+    # Count inodes, not names: the stubs are hardlinks.
+    info "packed $name: $BUILT_INODES inodes -> $(find "$prefix" "$image" -printf '%i\n' | sort -u | wc -l)"
     info "use it with: $PROG mount $name   or   $PROG exec $name -- <cmd>"
+}
+
+# ------------------------------------------------------ cmd: create / change --
+find_conda() {
+    local c=${HAVERSACK_CONDA:-}
+    [[ -n $c ]] || c=$(command -v conda || command -v mamba || command -v micromamba || true)
+    [[ -n $c ]] || die "no conda, mamba or micromamba on PATH. Load one first (e.g. module load miniconda), or set HAVERSACK_CONDA."
+    CONDA=$c
+}
+
+# Where 'conda create -n NAME' would put NAME: the first envs directory.
+conda_envs_dir() {
+    local d
+    d=$("$CONDA" config --show envs_dirs | awk '/^ *- / { print $2; exit }' || true)
+    [[ -n $d ]] || d=${CONDA_ENVS_PATH:+${CONDA_ENVS_PATH%%:*}}
+    [[ -n $d ]] || die "could not tell where $CONDA puts named environments; pass -p PATH instead of -n"
+    printf '%s\n' "$d"
+}
+
+# Sets BUILD rather than printing it: called in $(...), the addition to
+# CLEANUP would happen in a subshell and the directory would never be removed.
+new_build_dir() {                  # name -> sets BUILD to a fresh node-local build directory
+    local root=${HAVERSACK_BUILD_DIR:-${TMPDIR:-/tmp}}
+    mkdir -p "$root"
+    BUILD=$(mktemp -d "$root/haversack-build.$1.XXXXXX")
+    CLEANUP+=("$BUILD")
+}
+
+# Run a command against prefix with the node-local directory src bound over
+# it, inside a private mount namespace.  conda sees the environment's real
+# path, so everything it bakes in names the final location, while every file
+# it writes lands on local disk.  The only traces of the build left in the
+# environment are conda's notes of where its package cache was, which nothing
+# reads once the build is finished.
+build_ns() {                       # src prefix pkgs command...
+    local src=$1 prefix=$2 pkgs=$3; shift 3
+    CONDA_PKGS_DIRS=$pkgs unshare -Urm --map-root-user /bin/bash -c '
+        mount --bind "$1" "$2" || { echo "haversack: could not bind the build directory over $2" >&2; exit 1; }
+        shift 2
+        "$@"
+    ' _ "$src" "$prefix" "$@" 7>&- 8>&-
+}
+
+build_prereqs() {
+    need MKSQUASHFS "mksquashfs"; need UNSQUASHFS "unsquashfs"
+    need SQUASHFUSE "squashfuse"; need FUSERMOUNT "fusermount"
+    have_userns || die "building needs unprivileged user namespaces, which are unavailable here"
+    find_conda
+    warn_if_login_node "$1"
+}
+
+cmd_create() {
+    local name="" prefix="" file="" to="" jobs=${SLURM_CPUS_PER_TASK:-$(nproc)} comp=zstd level=8 fix=0
+    local args=()
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -n|--name)   name=$2; shift 2 ;;
+            -p|--prefix) prefix=$2; shift 2 ;;
+            -f|--file)   file=$2; shift 2 ;;
+            --to)        to=$2; shift 2 ;;
+            -j|--jobs)   jobs=$2; shift 2 ;;
+            --level)     level=$2; shift 2 ;;
+            --fix-cuda)  fix=1; shift ;;
+            --)          shift; args+=("$@"); break ;;
+            *)           args+=("$1"); shift ;;
+        esac
+    done
+    [[ -n $name || -n $prefix ]] || die "usage: $PROG create -n NAME | -p PATH [-f env.yml] [--fix-cuda] [conda create arguments...]"
+    build_prereqs create
+
+    [[ -n $prefix ]] || prefix=$(conda_envs_dir)/$name
+    mkdir -p "$(dirname "$prefix")"
+    prefix=$(cd "$(dirname "$prefix")" && pwd -P)/${prefix##*/}
+    name=${name:-${prefix##*/}}
+    valid_name "$name"
+    lock_env "$name" 0
+    index_get "$name" >/dev/null && die "'$name' already exists. Change it with '$PROG install|update|remove $name ...'."
+    clean_stale "$prefix"
+    is_mounted "$prefix" && die "$prefix is mounted; not building over it"
+    if [[ -e $prefix && -n "$(ls -A "$prefix")" ]]; then
+        die "$prefix already exists and is not empty. To turn an existing environment into an image, use '$PROG pack $prefix'."
+    fi
+    to=${to:-${HAVERSACK_IMAGES:-$(dirname "$prefix")/.haversack}}
+    mkdir -p "$to"
+    local image; image=$(cd "$to" && pwd -P)/$name.sqfs
+    [[ ! -e $image ]] || die "$image already exists; move it aside or pass --to"
+
+    local build src pkgs cmd
+    new_build_dir "$name"; build=$BUILD
+    src=$build/prefix; pkgs=${HAVERSACK_PKGS_DIR:-$build/pkgs}
+    [[ -e $prefix ]] || CLEANUP_EMPTY+=("$prefix")
+    mkdir -p "$src" "$pkgs" "$prefix"
+    if [[ -n $file ]]; then
+        file=$(cd "$(dirname "$file")" && pwd -P)/${file##*/}
+        case ${CONDA##*/} in
+            micromamba) cmd=("$CONDA" create -y -p "$prefix" -f "$file" "${args[@]}") ;;
+            *)          cmd=("$CONDA" env create -p "$prefix" -f "$file" "${args[@]}") ;;
+        esac
+    else
+        cmd=("$CONDA" create -y -p "$prefix" "${args[@]}")
+    fi
+    info "building $name in $build"
+    build_ns "$src" "$prefix" "$pkgs" "${cmd[@]}" || die "${CONDA##*/} failed; nothing was created"
+    [[ -d $src/conda-meta ]] || die "${CONDA##*/} finished but left no environment behind; nothing was created"
+
+    [[ $fix == 1 ]] && fix_cuda "$src" "$prefix"
+    build_image "$src" "$prefix" "$name" "$image" "$jobs" "$comp" "$level"
+    index_put "$name" "$image" "$prefix"
+    make_mountpoint "$prefix" "$name" "$image" || die "the image is registered, but the mountpoint at $prefix could not be made"
+    info "created $name: $BUILT_INODES inodes packed into $image"
+    info "use it with: $PROG exec $name -- <cmd>   or   $PROG mount $name"
+}
+
+# install / update / remove: unpack the image to node-local disk, run the
+# conda command there at the environment's real path, and pack the result as
+# the new image.  The old image is replaced by a rename, so commands already
+# running from it keep using it until they exit.
+cmd_rebuild() {
+    local verb=$1; shift
+    local name="" jobs=${SLURM_CPUS_PER_TASK:-$(nproc)} comp=zstd level=8 fix=0 args=()
+    if [[ $# -gt 0 && $1 != -* ]]; then name=$1; shift; fi
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -n|--name)  name=$2; shift 2 ;;
+            -j|--jobs)  jobs=$2; shift 2 ;;
+            --level)    level=$2; shift 2 ;;
+            --fix-cuda) fix=1; shift ;;
+            --)         shift; args+=("$@"); break ;;
+            *)          args+=("$1"); shift ;;
+        esac
+    done
+    [[ -n $name ]] || die "usage: $PROG $verb NAME [conda $verb arguments...]"
+    build_prereqs "$verb"
+    resolve "$name"
+    lock_env "$name" 0
+    clean_stale "$PREFIX"
+    if [[ $(mount_state "$PREFIX") == mounted ]]; then
+        die "'$name' is mounted on this node; unmount it first ($PROG umount $name).
+Commands running under '$PROG exec' are not affected by changing the environment."
+    fi
+    if is_live "$PREFIX"; then
+        die "the original environment is still at $PREFIX (packed with --keep).
+Change it with ${CONDA##*/} directly, then run '$PROG pack $PREFIX'."
+    fi
+
+    local build src pkgs n_before
+    new_build_dir "$name"; build=$BUILD
+    src=$build/prefix; pkgs=${HAVERSACK_PKGS_DIR:-$build/pkgs}
+    mkdir -p "$pkgs"
+    info "unpacking $name into $build"
+    "$UNSQUASHFS" -d "$src" "$IMAGE" >/dev/null 7>&- 8>&-
+    n_before=$(find "$src" | wc -l)
+    build_ns "$src" "$PREFIX" "$pkgs" "$CONDA" "$verb" -y -p "$PREFIX" "${args[@]}" || \
+        die "${CONDA##*/} $verb failed; the image is unchanged"
+
+    [[ $fix == 1 ]] && fix_cuda "$src" "$PREFIX"
+    build_image "$src" "$PREFIX" "$name" "$IMAGE" "$jobs" "$comp" "$level"
+    refresh_mountpoint "$PREFIX" "$name" "$IMAGE"
+    info "$verb done: $name has $BUILT_INODES inodes (was $n_before)"
+}
+
+# edit: unpack to node-local disk and open a shell - or run one command - with
+# the environment writable at its real path, then pack whatever changed as the
+# new image.  This is how pip gets into a packed environment, and how several
+# changes cost a single repack.
+cmd_edit() {
+    local name=${1:?usage: $PROG edit NAME [-- command...]}; shift
+    local jobs=${SLURM_CPUS_PER_TASK:-$(nproc)} comp=zstd level=8
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -j|--jobs) jobs=$2; shift 2 ;;
+            --level)   level=$2; shift 2 ;;
+            --)        shift; break ;;
+            *)         break ;;
+        esac
+    done
+    local cmd=("$@")
+    need MKSQUASHFS "mksquashfs"; need UNSQUASHFS "unsquashfs"
+    need SQUASHFUSE "squashfuse"; need FUSERMOUNT "fusermount"
+    have_userns || die "editing needs unprivileged user namespaces, which are unavailable here"
+    not_in_exec edit
+    warn_if_login_node edit
+    resolve "$name"
+    lock_env "$name" 0
+    clean_stale "$PREFIX"
+    if [[ $(mount_state "$PREFIX") == mounted ]]; then
+        die "'$name' is mounted on this node; unmount it first ($PROG umount $name)"
+    fi
+    if is_live "$PREFIX"; then
+        die "the original environment is still at $PREFIX (packed with --keep); change it directly, then run '$PROG pack $PREFIX'"
+    fi
+
+    local build src marker rc
+    new_build_dir "$name"; build=$BUILD
+    src=$build/prefix
+    mkdir -p "$build/pkgs"
+    info "unpacking $name into $build"
+    "$UNSQUASHFS" -d "$src" "$IMAGE" >/dev/null 7>&- 8>&-
+    # Anything changed after this - written, removed, renamed, chmodded -
+    # has a newer ctime than the marker, or its directory does.
+    marker=$build/.edit-start
+    : > "$marker"
+    sleep 1
+
+    local inside
+    inside="$(env_snippet "$PREFIX" "$name")"$'\n'"export HAVERSACK_NS=$(printf '%q' "$name")"
+    set +e
+    if [[ ${#cmd[@]} -gt 0 ]]; then
+        build_ns "$src" "$PREFIX" "$build/pkgs" /bin/bash -c "$inside"$'\n''exec "$@"' _ "${cmd[@]}"
+        rc=$?
+    else
+        { echo '[ -f ~/.bashrc ] && . ~/.bashrc'
+          printf '%s\n' "$inside"
+          printf 'PS1="(haversack edit %s) ${PS1-\\$ }"\n' "$name"
+        } > "$build/.editrc"
+        info "editing $name: it is writable at $PREFIX in this shell. Use conda or pip as usual, then exit."
+        build_ns "$src" "$PREFIX" "$build/pkgs" /bin/bash --rcfile "$build/.editrc" -i
+        rc=0
+    fi
+    set -e
+    [[ $rc -eq 0 ]] || die "the command exited with status $rc; nothing was saved"
+
+    if [[ -z $(find "$src" -cnewer "$marker" -print -quit) ]]; then
+        info "no changes; $name is unchanged"
+        return 0
+    fi
+    if [[ ${#cmd[@]} -eq 0 && -t 0 ]]; then
+        local reply
+        read -r -p "Save the changes to $name? [y/N] " reply
+        [[ $reply == [yY]* ]] || { info "discarded; $name is unchanged"; return 0; }
+    fi
+    build_image "$src" "$PREFIX" "$name" "$IMAGE" "$jobs" "$comp" "$level"
+    refresh_mountpoint "$PREFIX" "$name" "$IMAGE"
+    info "saved $name: $BUILT_INODES inodes"
 }
 
 # -------------------------------------------------------------- cmd: mount --
@@ -492,6 +771,13 @@ cmd_mount() {
     resolve "$name"
     lock_env "$name" 60
     clean_stale "$PREFIX"
+    # Slurm ends every process of a job when the job ends, squashfuse included,
+    # so a mount made in one job disappears from under every other job on the
+    # node that is using it.
+    if [[ -n ${SLURM_JOB_ID:-} ]]; then
+        warn "inside Slurm job $SLURM_JOB_ID, a mount lasts only as long as the job that made it, and
+other jobs on $HOST using it lose it when that job ends. In batch jobs, use '$PROG exec $name -- <cmd>'."
+    fi
     if [[ $(mount_state "$PREFIX") == mounted ]]; then info "already mounted: $PREFIX"; return 0; fi
     clean_leftovers "$PREFIX"
     if is_live "$PREFIX"; then
@@ -568,8 +854,11 @@ cmd_exec() {
         unlock_env
         state=$(mount_state "$PREFIX")
     fi
-    # Already mounted on this node, or inside an exec of this environment.
-    if [[ $state == mounted ]] && is_live "$PREFIX"; then
+    # Already inside an exec of this environment: its private mount is right
+    # here.  A mount made by 'mount' is never reused, even when present: it
+    # lives only as long as the process that made it - in a batch job, as long
+    # as that job - and would take this command's files with it when it goes.
+    if [[ ${HAVERSACK_NS:-} == "$name" && $state == mounted ]] && is_live "$PREFIX"; then
         exec /bin/bash -c "$run" _ "$@"
     fi
 
@@ -583,7 +872,21 @@ Use '$PROG mount $name' instead, and unmount when you are done."
 
 cmd_shell() {
     local name=${1:?usage: $PROG shell <name>}
-    cmd_exec "$name" -- "${SHELL:-/bin/bash}"
+    resolve "$name"
+    local sh=${SHELL:-/bin/bash} rc
+    if [[ ${sh##*/} != bash ]]; then
+        cmd_exec "$name" -- "$sh"
+    fi
+    # An interactive bash reads ~/.bashrc after the environment is set up, and
+    # anything there that puts directories in front of PATH would shadow the
+    # environment's own executables.  Hand it an rc file that reads ~/.bashrc
+    # first and sets up the environment after.  It goes in on an inherited file
+    # descriptor: this process is replaced by the namespace runner, so a
+    # temporary file would never be cleaned up.
+    rc='[ -f ~/.bashrc ] && . ~/.bashrc'$'\n'"$(env_snippet "$PREFIX" "$name")"$'\n'
+    rc+="PS1=\"($name) \${PS1-\\\$ }\""
+    exec 9<<<"$rc"
+    cmd_exec "$name" -- "$sh" --rcfile /dev/fd/9 -i
 }
 
 # ----------------------------------------------------------- cmd: activate --
@@ -602,13 +905,13 @@ unset _cs_f
 EOF
 }
 
-# Emits shell code; meant to be used as:  eval "$(conda-squash activate tz)"
+# Emits shell code; meant to be used as:  eval "$(haversack activate tz)"
 cmd_activate() {
     local name=${1:?usage: eval \"\$($PROG activate <name>)\"}
     resolve "$name"
     local self_q; self_q=$(printf '%q' "$SELF")
 
-    if [[ ${CONDA_SQUASH_ACTIVE:-} == "$name" ]]; then
+    if [[ ${HAVERSACK_ACTIVE:-} == "$name" ]]; then
         # Already active here.  Only make sure this shell is registered - it
         # may be a child that inherited the environment from its parent.
         printf '%s _ref add %q "$$"\n' "$self_q" "$name"
@@ -624,25 +927,29 @@ cmd_activate() {
     # this mount and the eval.  The emitted line registers it again by its own
     # $$, in case the caller ran this from a subshell.
     ref_add "$name" "$PPID"
-    [[ -n ${CONDA_SQUASH_ACTIVE:-} ]] && cmd_deactivate
-    printf 'export CONDA_SQUASH_OLD_PATH="${CONDA_SQUASH_OLD_PATH-$PATH}"\n'
-    printf 'export CONDA_SQUASH_ACTIVE=%q\n' "$name"
+    [[ -n ${HAVERSACK_ACTIVE:-} ]] && cmd_deactivate
+    printf 'export HAVERSACK_OLD_PATH="${HAVERSACK_OLD_PATH-$PATH}"\n'
+    printf 'export HAVERSACK_ACTIVE=%q\n' "$name"
     env_snippet "$PREFIX" "$name"
     printf '%s _ref add %q "$$"\n' "$self_q" "$name"
 }
 
 cmd_deactivate() {
-    local name=${CONDA_SQUASH_ACTIVE:-}
+    local name=${HAVERSACK_ACTIVE:-}
     if [[ -z $name ]]; then echo ':'; return 0; fi
     cat <<'EOF'
 for _cs_f in "$CONDA_PREFIX"/etc/conda/deactivate.d/*.sh; do
     [ -e "$_cs_f" ] && . "$_cs_f"
 done
 unset _cs_f
-[ -n "${CONDA_SQUASH_OLD_PATH+x}" ] && export PATH="$CONDA_SQUASH_OLD_PATH"
+[ -n "${HAVERSACK_OLD_PATH+x}" ] && export PATH="$HAVERSACK_OLD_PATH"
 EOF
+    # activate registered the caller by this process's parent and by the
+    # emitted $$.  Inside a subshell those are different processes ($$ keeps
+    # the outer shell's PID), so drop both.
+    ref_del "$name" "$PPID"
     printf '%q _ref del %q "$$"\n' "$SELF" "$name"
-    echo 'unset CONDA_SQUASH_OLD_PATH CONDA_SQUASH_ACTIVE CONDA_PREFIX CONDA_DEFAULT_ENV'
+    echo 'unset HAVERSACK_OLD_PATH HAVERSACK_ACTIVE CONDA_PREFIX CONDA_DEFAULT_ENV'
 }
 
 cmd__ref() {
@@ -651,6 +958,55 @@ cmd__ref() {
         del) ref_del "${2:?}" "${3:?}" ;;
         *)   die "internal: _ref add|del <name> <pid>" ;;
     esac
+}
+
+# ---------------------------------------------------------------- cmd: delete --
+cmd_delete() {
+    local name="" yes=0
+    while [[ $# -gt 0 ]]; do
+        case $1 in
+            -y|--yes) yes=1; shift ;;
+            -*)       die "delete: unknown option $1" ;;
+            *)        name=$1; shift ;;
+        esac
+    done
+    [[ -n "$name" ]] || die "usage: $PROG delete <name> [-y]"
+    not_in_exec delete
+    resolve "$name" allow-missing
+    lock_env "$name" 0
+    clean_stale "$PREFIX"
+    if [[ $(mount_state "$PREFIX") == mounted ]]; then
+        die "'$name' is mounted on this node; unmount it first ($PROG umount $name)"
+    fi
+    if is_live "$PREFIX"; then
+        die "the original environment is still at $PREFIX (packed with --keep), so deleting the image would not delete the environment.
+To drop just the image: '$PROG forget $name' and remove $IMAGE."
+    fi
+    if [[ $yes != 1 ]]; then
+        [[ -t 0 ]] || die "no terminal to confirm the delete; pass -y. Nothing was deleted."
+        printf 'Delete %s and its image %s? This cannot be undone.\n' "$PREFIX" "$IMAGE" >&2
+        local reply
+        read -r -p "Type '$name' to confirm: " reply
+        [[ "$reply" == "$name" ]] || die "not confirmed; nothing was deleted"
+    fi
+    # Unregister first, so an interrupted delete leaves stray files rather than
+    # a name that points at nothing.  Commands already running from the image
+    # hold it open and keep it until they exit.
+    index_del "$name"
+    rm -f -- "$IMAGE"
+    # Empty the mountpoint but keep the directory: removing a directory detaches
+    # every mount on it, including the private mounts of commands still running
+    # from this environment under exec, on this node or any other.
+    if is_sealed "$PREFIX"; then
+        find "$PREFIX" -mindepth 1 -delete
+    fi
+    rm -rf -- "${REFS:?}/$name"
+    rm -f -- "$LOCKS/$name.lock"
+    if [[ -d $(dirname "$IMAGE") ]]; then rmdir --ignore-fail-on-non-empty -- "$(dirname "$IMAGE")"; fi
+    info "deleted $name"
+    if [[ -d $PREFIX ]]; then
+        info "left the empty directory $PREFIX; remove it with rmdir once nothing is running from it"
+    fi
 }
 
 # -------------------------------------------------------------- cmd: unpack --
@@ -669,8 +1025,7 @@ cmd_unpack() {
     # interrupt never leaves a partial environment at the real path.
     local tmp n_img n_tmp
     tmp=$(leftover_path unpack "$PREFIX")
-    trap "rm -rf $(printf '%q' "$tmp")" EXIT
-    trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+    CLEANUP+=("$tmp")
     info "restoring $name ..."
     "$UNSQUASHFS" -d "$tmp" "$IMAGE" >/dev/null 7>&- 8>&-
     n_img=$(count_image "$IMAGE"); n_tmp=$(find "$tmp" | wc -l)
@@ -679,7 +1034,7 @@ cmd_unpack() {
     trap '' INT TERM HUP
     rm -rf "$PREFIX"
     mv "$tmp" "$PREFIX"
-    trap - INT TERM HUP
+    trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
     info "restored $name to $PREFIX ($n_tmp inodes)"
     info "the image is still at $IMAGE; remove it and run '$PROG forget $name' when you are sure"
 }
@@ -751,7 +1106,7 @@ cmd_doctor() {
     printf '%-14s %s\n' flock       "${FLOCK:-NOT FOUND}"
     printf '%-14s %s\n' registry    "$REGISTRY"
     if have_userns; then
-        printf '%-14s yes (conda-squash exec available)\n' 'user ns'
+        printf '%-14s yes (haversack exec available)\n' 'user ns'
     else
         printf '%-14s no (use mount/umount instead of exec)\n' 'user ns'
     fi
@@ -778,6 +1133,15 @@ $PROG $VERSION - collapse a conda environment into a single squashfs image
           -y        do not prompt before deleting
           --force   delete even if processes on this node are using the env
           --name    register under a name other than the directory's
+  $PROG create -n NAME | -p PATH [-f env.yml] [--fix-cuda] [conda create arguments...]
+        Build a new environment on node-local disk and pack it straight into
+        an image; nothing is extracted on the shared filesystem.
+  $PROG install|update|remove NAME [conda arguments...]
+        Change a packed environment: rebuilt on node-local disk, repacked and
+        swapped in. Commands already running keep the old image.
+  $PROG edit NAME [-- command...]
+        Make the environment writable on node-local disk for a shell, or one
+        command, then repack what changed. Use it for pip, or to batch changes.
   $PROG unpack <name>
         Restore the environment from its image. The way back out.
 
@@ -791,17 +1155,47 @@ $PROG $VERSION - collapse a conda environment into a single squashfs image
   eval "\$($PROG activate <name>)"   /   eval "\$($PROG deactivate)"
         Put the environment on PATH in the current shell, mounting it if needed.
 
+  $PROG delete <name> [-y]
+        Delete a packed environment: its image, its mountpoint and its entry.
+
   $PROG list / verify <name> / forget <name> [--force] / doctor
 
 Environment:
-  CONDA_SQUASH_IMAGES     where images go (default: <env-parent>/.squashed)
-  CONDA_SQUASH_REGISTRY   index, locks and activation records
-                          (default: ~/.local/share/conda-squash)
+  HAVERSACK_IMAGES     where images go (default: <env-parent>/.haversack)
+  HAVERSACK_CONDA      conda, mamba or micromamba to build with (default: first on PATH)
+  HAVERSACK_BUILD_DIR  node-local directory for builds (default: \$TMPDIR, else /tmp)
+  HAVERSACK_PKGS_DIR   package cache for builds (default: a fresh one inside the build)
+  HAVERSACK_REGISTRY   index, locks and activation records
+                          (default: ~/.local/share/haversack)
 EOF
 }
 
+# Paths to remove when this command exits, however it exits: temporary images,
+# build directories, restore directories.  Once one has been moved into place
+# its path is gone and there is nothing to remove.  CLEANUP_EMPTY holds
+# directories this command created that should go only if still empty.
+CLEANUP=()
+CLEANUP_EMPTY=()
+cleanup() {
+    local p
+    # Every step tolerates failure: under set -e, a failure in an exit trap
+    # replaces the command's own exit status.
+    for p in "${CLEANUP[@]}"; do
+        # A build can contain read-only directories.
+        if [[ -e $p ]]; then chmod -R u+w -- "$p" 2>/dev/null || true; rm -rf -- "$p" || true; fi
+    done
+    # Directories that were filled in on success are expected to stay.
+    for p in "${CLEANUP_EMPTY[@]}"; do rmdir -- "$p" 2>/dev/null || true; done
+    return 0
+}
+trap cleanup EXIT
+trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP
+
 case ${1:-} in
     pack)       shift; cmd_pack "$@" ;;
+    create)     shift; cmd_create "$@" ;;
+    install|update|remove) cmd_rebuild "$@" ;;
+    edit)       shift; cmd_edit "$@" ;;
     unpack)     shift; cmd_unpack "$@" ;;
     mount)      shift; cmd_mount "$@" ;;
     umount|unmount) shift; cmd_umount "$@" ;;
@@ -811,6 +1205,7 @@ case ${1:-} in
     deactivate) shift; cmd_deactivate "$@" ;;
     list|ls)    shift; cmd_list "$@" ;;
     verify)     shift; cmd_verify "$@" ;;
+    delete)     shift; cmd_delete "$@" ;;
     forget)     shift; cmd_forget "$@" ;;
     doctor)     shift; cmd_doctor "$@" ;;
     _ref)       shift; cmd__ref "$@" ;;
