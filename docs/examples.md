@@ -8,6 +8,20 @@ Commands that build or change an environment (`create`, `pack`, `install`,
 `update`, `remove`, `edit`) do real work. On a cluster, run them inside an
 allocation, not on a login node.
 
+## Do I still need `module load miniconda`?
+
+Only where conda itself runs:
+
+- `create`, `install`, `update` and `remove` call conda, so it must be on `PATH`
+  (or named in `HAVERSACK_CONDA`).
+- `conda activate`, `conda list` and other conda commands need it as always -
+  including inside `haversack exec` or after `haversack mount`.
+
+Everything else works without it. `haversack exec tz -- python train.py` puts
+the environment's `bin/` on `PATH` and runs its activation hooks itself, and
+`mount`, `shell`, `edit -- pip install ...`, `list` and `delete` never touch
+conda.
+
 ## Create an environment
 
 conda:

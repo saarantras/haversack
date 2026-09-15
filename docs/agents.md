@@ -95,6 +95,7 @@ environments, and the index, locks and activation records live under their own
 | `another haversack command is already working on 'NAME'` | Another command holds the lock | Wait and retry. Do not delete lock files. |
 | `'NAME' is still in use on this node` from `umount` | Processes or shells are using it; they are named | Tell the user. Do not force. |
 | `prefix already exists` from `conda create`, or an error from `conda install -n NAME` | conda was aimed at a packed environment | Use `haversack create` for a new name, or `haversack install` / `haversack edit` to change this one |
+| `Bad owner or permissions on /etc/ssh/...`, or `/root/.ssh/known_hosts: Permission denied` | `ssh` does not work inside `exec`, `shell` or `edit` | Run SSH-based commands (`git` over SSH, `scp`, `rsync`) outside haversack, or use `git` over HTTPS |
 | The environment is missing from `conda env list` | Packed environments are listed only where mounted, or inside `exec` | Check `haversack list` |
 
 `haversack list` shows every packed environment with its state on this node:

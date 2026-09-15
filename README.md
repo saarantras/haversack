@@ -16,6 +16,11 @@ their original paths.
 | Remove a package | `conda remove -n tz scipy` | `haversack remove tz scipy` |
 | Delete an environment | `conda env remove -n tz` | `haversack delete tz` |
 
+`module load miniconda` (or any conda on `PATH`) is still needed wherever conda
+itself runs: `create`, `install`, `update`, `remove`, and `conda activate`.
+`haversack exec` and `haversack shell` need no conda; they set up the
+environment themselves.
+
 More side by side - job arrays, calling an interpreter by path, several changes
 at once, CUDA wheels - in [docs/examples.md](docs/examples.md). Installing or
 using haversack through an AI agent: [docs/agents.md](docs/agents.md).
@@ -233,9 +238,13 @@ once, so it is built to hold up to that:
   server's lock manager.
 - A FUSE mount belongs to the user who made it; unless `user_allow_other` is set
   in `/etc/fuse.conf`, other users on the same node cannot see into it.
-- `exec` runs under `unshare --map-root-user`, so `id -u` reads 0 inside. File
-  ownership still maps back to you; only tools that refuse to "run as root" will
-  notice.
+- `exec`, `shell` and `edit` run under `unshare --map-root-user`, so `id -u`
+  reads 0 inside and files owned by the real root show as owned by `nobody`.
+  File ownership still maps back to you, but tools that check ownership notice.
+  In particular `ssh` does not work inside: it rejects the system configuration
+  ("Bad owner or permissions") and looks for keys under `/root`. That rules out
+  `git` over SSH, `scp` and `rsync` over SSH in those commands; run them outside,
+  or use `git` over HTTPS, which works.
 - `shell` reads `~/.bashrc` before setting up the environment when your shell
   is bash. Other shells read their startup files after, so anything there that
   puts directories in front of `PATH` can shadow the environment's executables;
@@ -282,3 +291,7 @@ checks, `set -u`, and two array tasks sharing a node. It builds a small
 the same job body with
 the environment unmounted, mounted, under `exec`, and activated. Set
 `CONDA_SETUP` if your jobs get conda some other way than `module load miniconda`.
+
+## License
+
+MIT; see [LICENSE](LICENSE).

@@ -29,6 +29,10 @@ haversack repository.
   unchanged as `haversack exec NAME -- bash job-body.sh`.
 - Interactive work: `haversack mount NAME`, then `conda activate NAME` as usual;
   or `haversack shell NAME`.
+- `module load miniconda` (or any conda on `PATH`) is needed only where conda
+  itself runs: `create`, `install`, `update`, `remove`, and any `conda` command.
+  `haversack exec NAME -- python ...` needs no conda: it sets up `PATH` and the
+  environment's activation hooks itself.
 - Change a packed environment only through haversack:
   `haversack install|update|remove NAME [conda args]`, and
   `haversack edit NAME -- pip install ...` for pip. Never `conda install -n NAME`,
@@ -62,5 +66,9 @@ haversack repository.
 - "prefix already exists" from `conda create`, or an error from
   `conda install -n NAME`: conda was aimed at a packed environment. Use
   `haversack install` or `haversack edit` to change it.
+- "Bad owner or permissions on /etc/ssh/..." or "/root/.ssh/known_hosts:
+  Permission denied": `ssh` cannot work inside `exec`, `shell` or `edit` (you
+  appear as root in a user namespace). Run SSH-based commands - `git` over SSH,
+  `scp`, `rsync` - outside haversack, or use `git` over HTTPS.
 - A packed environment missing from `conda env list`: it is only listed where
   mounted or inside `exec`. Use `haversack list`.
