@@ -1,7 +1,26 @@
 # haversack
 
-Collapse a conda environment into a single squashfs image, and mount it back at
-its own original path.
+Pack conda environments into single compressed images, and keep using them at
+their original paths.
+
+| | conda | haversack |
+|---|---|---|
+| Create an environment | `conda create -n tz python=3.11 numpy` | `haversack create -n tz python=3.11 numpy` |
+| Create from a file | `conda env create -n tz -f environment.yml` | `haversack create -n tz -f environment.yml` |
+| Convert an existing environment | - | `haversack pack ~/.conda/envs/tz` |
+| Run in a batch job | `conda activate tz`<br>`python train.py` | `haversack exec tz -- python train.py` |
+| Work interactively | `conda activate tz` | `haversack mount tz`<br>`conda activate tz` |
+| Run one command | `conda run -n tz python script.py` | `haversack exec tz -- python script.py` |
+| Install a package | `conda install -n tz scipy` | `haversack install tz scipy` |
+| Install with pip | `conda activate tz`<br>`pip install some-package` | `haversack edit tz -- pip install some-package` |
+| Remove a package | `conda remove -n tz scipy` | `haversack remove tz scipy` |
+| Delete an environment | `conda env remove -n tz` | `haversack delete tz` |
+
+More side by side - job arrays, calling an interpreter by path, several changes
+at once, CUDA wheels - in [docs/examples.md](docs/examples.md). Installing or
+using haversack through an AI agent: [docs/agents.md](docs/agents.md).
+
+## Why
 
 A conda environment is tens of thousands of small files. On a shared cluster
 filesystem that is expensive twice over: it eats the group's inode quota, and
@@ -27,13 +46,6 @@ $ python -c "import tensorflow"     # just works
 Measured on a 94,592-file environment: **94,592 inodes to 11**, 7.9G to 3.6G, and
 about **5x faster interpreter startup** than the same environment on NFS, because
 one sequential read of a compressed file beats thousands of metadata lookups.
-
-For everyday conda tasks next to their haversack equivalents - creating,
-activating, batch jobs, job arrays, installing with conda or pip - see
-[docs/examples.md](docs/examples.md).
-
-Installing or using haversack through an AI agent: see
-[docs/agents.md](docs/agents.md).
 
 ## What pack does
 
